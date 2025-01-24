@@ -1,31 +1,32 @@
 package delete
 
 import (
-	"context"
 	"fmt"
 	"net/http"
-	"strconv"
 
-	"github.com/AlecAivazis/survey/v2"
-	"github.com/cli/cli/v2/internal/config"
-	"github.com/cli/cli/v2/internal/ghinstance"
+	"github.com/cli/cli/v2/api"
+	"github.com/cli/cli/v2/internal/gh"
 	"github.com/cli/cli/v2/internal/ghrepo"
 	"github.com/cli/cli/v2/pkg/cmd/issue/shared"
 	"github.com/cli/cli/v2/pkg/cmdutil"
 	"github.com/cli/cli/v2/pkg/iostreams"
-	"github.com/cli/cli/v2/pkg/prompt"
-	graphql "github.com/cli/shurcooL-graphql"
 	"github.com/shurcooL/githubv4"
 	"github.com/spf13/cobra"
 )
 
 type DeleteOptions struct {
 	HttpClient func() (*http.Client, error)
-	Config     func() (config.Config, error)
+	Config     func() (gh.Config, error)
 	IO         *iostreams.IOStreams
 	BaseRepo   func() (ghrepo.Interface, error)
+	Prompter   iprompter
 
 	SelectorArg string
+	Confirmed   bool
+}
+
+type iprompter interface {
+	ConfirmDeletion(string) error
 }
 
 func NewCmdDelete(f *cmdutil.Factory, runF func(*DeleteOptions) error) *cobra.Command {
@@ -33,6 +34,7 @@ func NewCmdDelete(f *cmdutil.Factory, runF func(*DeleteOptions) error) *cobra.Co
 		IO:         f.IOStreams,
 		HttpClient: f.HttpClient,
 		Config:     f.Config,
+		Prompter:   f.Prompter,
 	}
 
 	cmd := &cobra.Command{
@@ -50,10 +52,14 @@ func NewCmdDelete(f *cmdutil.Factory, runF func(*DeleteOptions) error) *cobra.Co
 			if runF != nil {
 				return runF(opts)
 			}
+
 			return deleteRun(opts)
 		},
 	}
 
+	cmd.Flags().BoolVar(&opts.Confirmed, "confirm", false, "confirm deletion without prompting")
+	_ = cmd.Flags().MarkDeprecated("confirm", "use `--yes` instead")
+	cmd.Flags().BoolVar(&opts.Confirmed, "yes", false, "confirm deletion without prompting")
 	return cmd
 }
 
@@ -70,25 +76,17 @@ func deleteRun(opts *DeleteOptions) error {
 		return err
 	}
 	if issue.IsPullRequest() {
-		return fmt.Errorf("issue #%d is a pull request and cannot be deleted", issue.Number)
+		return fmt.Errorf("issue %s#%d is a pull request and cannot be deleted", ghrepo.FullName(baseRepo), issue.Number)
 	}
 
-	// When executed in an interactive shell, require confirmation. Otherwise skip confirmation.
-	if opts.IO.CanPrompt() {
-		answer := ""
-		err = prompt.SurveyAskOne(
-			&survey.Input{
-				Message: fmt.Sprintf("You're going to delete issue #%d. This action cannot be reversed. To confirm, type the issue number:", issue.Number),
-			},
-			&answer,
-		)
+	// When executed in an interactive shell, require confirmation, unless
+	// already provided. Otherwise skip confirmation.
+	if opts.IO.CanPrompt() && !opts.Confirmed {
+		cs := opts.IO.ColorScheme()
+		fmt.Printf("%s Deleted issues cannot be recovered.\n", cs.WarningIcon())
+		err := opts.Prompter.ConfirmDeletion(fmt.Sprintf("%d", issue.Number))
 		if err != nil {
 			return err
-		}
-		answerInt, err := strconv.Atoi(answer)
-		if err != nil || answerInt != issue.Number {
-			fmt.Fprintf(opts.IO.Out, "Issue #%d was not deleted.\n", issue.Number)
-			return nil
 		}
 	}
 
@@ -97,7 +95,7 @@ func deleteRun(opts *DeleteOptions) error {
 	}
 
 	if opts.IO.IsStdoutTTY() {
-		fmt.Fprintf(opts.IO.ErrOut, "%s Deleted issue #%d (%s).\n", cs.Red("✔"), issue.Number, issue.Title)
+		fmt.Fprintf(opts.IO.ErrOut, "%s Deleted issue %s#%d (%s).\n", cs.Red("✔"), ghrepo.FullName(baseRepo), issue.Number, issue.Title)
 	}
 
 	return nil
@@ -118,6 +116,6 @@ func apiDelete(httpClient *http.Client, repo ghrepo.Interface, issueID string) e
 		},
 	}
 
-	gql := graphql.NewClient(ghinstance.GraphQLEndpoint(repo.RepoHost()), httpClient)
-	return gql.MutateNamed(context.Background(), "IssueDelete", &mutation, variables)
+	gql := api.NewClientFromHTTP(httpClient)
+	return gql.Mutate(repo.RepoHost(), "IssueDelete", &mutation, variables)
 }
