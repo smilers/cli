@@ -1,41 +1,48 @@
 package status
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
 	"regexp"
 	"strconv"
-	"strings"
+	"time"
 
 	"github.com/cli/cli/v2/api"
-	"github.com/cli/cli/v2/context"
+	ghContext "github.com/cli/cli/v2/context"
 	"github.com/cli/cli/v2/git"
-	"github.com/cli/cli/v2/internal/config"
+	fd "github.com/cli/cli/v2/internal/featuredetection"
+	"github.com/cli/cli/v2/internal/gh"
 	"github.com/cli/cli/v2/internal/ghrepo"
+	"github.com/cli/cli/v2/internal/text"
 	"github.com/cli/cli/v2/pkg/cmd/pr/shared"
 	"github.com/cli/cli/v2/pkg/cmdutil"
 	"github.com/cli/cli/v2/pkg/iostreams"
-	"github.com/cli/cli/v2/pkg/text"
 	"github.com/spf13/cobra"
 )
 
 type StatusOptions struct {
 	HttpClient func() (*http.Client, error)
-	Config     func() (config.Config, error)
+	GitClient  *git.Client
+	Config     func() (gh.Config, error)
 	IO         *iostreams.IOStreams
 	BaseRepo   func() (ghrepo.Interface, error)
-	Remotes    func() (context.Remotes, error)
+	Remotes    func() (ghContext.Remotes, error)
 	Branch     func() (string, error)
 
 	HasRepoOverride bool
 	Exporter        cmdutil.Exporter
+	ConflictStatus  bool
+
+	Detector fd.Detector
 }
 
 func NewCmdStatus(f *cmdutil.Factory, runF func(*StatusOptions) error) *cobra.Command {
 	opts := &StatusOptions{
 		IO:         f.IOStreams,
 		HttpClient: f.HttpClient,
+		GitClient:  f.GitClient,
 		Config:     f.Config,
 		Remotes:    f.Remotes,
 		Branch:     f.Branch,
@@ -57,49 +64,96 @@ func NewCmdStatus(f *cmdutil.Factory, runF func(*StatusOptions) error) *cobra.Co
 		},
 	}
 
+	cmd.Flags().BoolVarP(&opts.ConflictStatus, "conflict-status", "c", false, "Display the merge conflict status of each pull request")
 	cmdutil.AddJSONFlags(cmd, &opts.Exporter, api.PullRequestFields)
 
 	return cmd
 }
 
 func statusRun(opts *StatusOptions) error {
+	ctx := context.Background()
 	httpClient, err := opts.HttpClient()
 	if err != nil {
 		return err
 	}
-	apiClient := api.NewClientFromHTTP(httpClient)
 
-	baseRepo, err := opts.BaseRepo()
+	baseRefRepo, err := opts.BaseRepo()
 	if err != nil {
 		return err
 	}
 
-	var currentBranch string
+	var currentBranchName string
 	var currentPRNumber int
-	var currentPRHeadRef string
+	var currentHeadRefBranchName string
 
 	if !opts.HasRepoOverride {
-		currentBranch, err = opts.Branch()
+		// We must be in a repo without the override
+		currentBranchName, err = opts.Branch()
 		if err != nil && !errors.Is(err, git.ErrNotOnAnyBranch) {
 			return fmt.Errorf("could not query for pull request for current branch: %w", err)
 		}
 
-		remotes, _ := opts.Remotes()
-		currentPRNumber, currentPRHeadRef, err = prSelectorForCurrentBranch(baseRepo, currentBranch, remotes)
+		branchConfig, err := opts.GitClient.ReadBranchConfig(ctx, currentBranchName)
+		if err != nil {
+			return err
+		}
+		// Determine if the branch is configured to merge to a special PR ref
+		prHeadRE := regexp.MustCompile(`^refs/pull/(\d+)/head$`)
+		if m := prHeadRE.FindStringSubmatch(branchConfig.MergeRef); m != nil {
+			currentPRNumber, _ = strconv.Atoi(m[1])
+		}
+
+		if currentPRNumber == 0 {
+			remotes, err := opts.Remotes()
+			if err != nil {
+				return err
+			}
+			// Suppressing these errors as we have other means of computing the PullRequestRefs when these fail.
+			parsedPushRevision, _ := opts.GitClient.ParsePushRevision(ctx, currentBranchName)
+
+			remotePushDefault, err := opts.GitClient.RemotePushDefault(ctx)
+			if err != nil {
+				return err
+			}
+
+			pushDefault, err := opts.GitClient.PushDefault(ctx)
+			if err != nil {
+				return err
+			}
+
+			prRefs, err := shared.ParsePRRefs(currentBranchName, branchConfig, parsedPushRevision, pushDefault, remotePushDefault, baseRefRepo, remotes)
+			if err != nil {
+				return err
+			}
+			currentHeadRefBranchName = prRefs.BranchName
+		}
+
 		if err != nil {
 			return fmt.Errorf("could not query for pull request for current branch: %w", err)
 		}
 	}
 
-	options := api.StatusOptions{
-		Username:  "@me",
-		CurrentPR: currentPRNumber,
-		HeadRef:   currentPRHeadRef,
+	options := requestOptions{
+		Username:       "@me",
+		CurrentPR:      currentPRNumber,
+		HeadRef:        currentHeadRefBranchName,
+		ConflictStatus: opts.ConflictStatus,
 	}
 	if opts.Exporter != nil {
 		options.Fields = opts.Exporter.Fields()
 	}
-	prPayload, err := api.PullRequestStatus(apiClient, baseRepo, options)
+
+	if opts.Detector == nil {
+		cachedClient := api.NewCachedHTTPClient(httpClient, time.Hour*24)
+		opts.Detector = fd.NewDetector(cachedClient, baseRefRepo.RepoHost())
+	}
+	prFeatures, err := opts.Detector.PullRequestFeatures()
+	if err != nil {
+		return err
+	}
+	options.CheckRunAndStatusContextCountsSupported = prFeatures.CheckRunAndStatusContextCounts
+
+	prPayload, err := pullRequestStatus(httpClient, baseRefRepo, options)
 	if err != nil {
 		return err
 	}
@@ -126,22 +180,24 @@ func statusRun(opts *StatusOptions) error {
 	cs := opts.IO.ColorScheme()
 
 	fmt.Fprintln(out, "")
-	fmt.Fprintf(out, "Relevant pull requests in %s\n", ghrepo.FullName(baseRepo))
+	fmt.Fprintf(out, "Relevant pull requests in %s\n", ghrepo.FullName(baseRefRepo))
 	fmt.Fprintln(out, "")
 
-	shared.PrintHeader(opts.IO, "Current branch")
-	currentPR := prPayload.CurrentPR
-	if currentPR != nil && currentPR.State != "OPEN" && prPayload.DefaultBranch == currentBranch {
-		currentPR = nil
+	if !opts.HasRepoOverride {
+		shared.PrintHeader(opts.IO, "Current branch")
+		currentPR := prPayload.CurrentPR
+		if currentPR != nil && currentPR.State != "OPEN" && prPayload.DefaultBranch == currentBranchName {
+			currentPR = nil
+		}
+		if currentPR != nil {
+			printPrs(opts.IO, 1, *currentPR)
+		} else if currentHeadRefBranchName == "" {
+			shared.PrintMessage(opts.IO, "  There is no current branch")
+		} else {
+			shared.PrintMessage(opts.IO, fmt.Sprintf("  There is no pull request associated with %s", cs.Cyan("["+currentHeadRefBranchName+"]")))
+		}
+		fmt.Fprintln(out)
 	}
-	if currentPR != nil {
-		printPrs(opts.IO, 1, *currentPR)
-	} else if currentPRHeadRef == "" {
-		shared.PrintMessage(opts.IO, "  There is no current branch")
-	} else {
-		shared.PrintMessage(opts.IO, fmt.Sprintf("  There is no pull request associated with %s", cs.Cyan("["+currentPRHeadRef+"]")))
-	}
-	fmt.Fprintln(out)
 
 	shared.PrintHeader(opts.IO, "Created by you")
 	if prPayload.ViewerCreated.TotalCount > 0 {
@@ -162,41 +218,14 @@ func statusRun(opts *StatusOptions) error {
 	return nil
 }
 
-func prSelectorForCurrentBranch(baseRepo ghrepo.Interface, prHeadRef string, rem context.Remotes) (prNumber int, selector string, err error) {
-	selector = prHeadRef
-	branchConfig := git.ReadBranchConfig(prHeadRef)
-
-	// the branch is configured to merge a special PR head ref
-	prHeadRE := regexp.MustCompile(`^refs/pull/(\d+)/head$`)
-	if m := prHeadRE.FindStringSubmatch(branchConfig.MergeRef); m != nil {
-		prNumber, _ = strconv.Atoi(m[1])
-		return
-	}
-
-	var branchOwner string
-	if branchConfig.RemoteURL != nil {
-		// the branch merges from a remote specified by URL
-		if r, err := ghrepo.FromURL(branchConfig.RemoteURL); err == nil {
-			branchOwner = r.RepoOwner()
-		}
-	} else if branchConfig.RemoteName != "" {
-		// the branch merges from a remote specified by name
-		if r, err := rem.FindByName(branchConfig.RemoteName); err == nil {
-			branchOwner = r.RepoOwner()
+func totalApprovals(pr *api.PullRequest) int {
+	approvals := 0
+	for _, review := range pr.LatestReviews.Nodes {
+		if review.State == "APPROVED" {
+			approvals++
 		}
 	}
-
-	if branchOwner != "" {
-		if strings.HasPrefix(branchConfig.MergeRef, "refs/heads/") {
-			selector = strings.TrimPrefix(branchConfig.MergeRef, "refs/heads/")
-		}
-		// prepend `OWNER:` if this branch is pushed to a fork
-		if !strings.EqualFold(branchOwner, baseRepo.RepoOwner()) {
-			selector = fmt.Sprintf("%s:%s", branchOwner, prHeadRef)
-		}
-	}
-
-	return
+	return approvals
 }
 
 func printPrs(io *iostreams.IOStreams, totalCount int, prs ...api.PullRequest) {
@@ -206,9 +235,9 @@ func printPrs(io *iostreams.IOStreams, totalCount int, prs ...api.PullRequest) {
 	for _, pr := range prs {
 		prNumber := fmt.Sprintf("#%d", pr.Number)
 
-		prStateColorFunc := cs.ColorFromString(shared.ColorForPR(pr))
+		prStateColorFunc := cs.ColorFromString(shared.ColorForPRState(pr))
 
-		fmt.Fprintf(w, "  %s  %s %s", prStateColorFunc(prNumber), text.Truncate(50, text.ReplaceExcessiveWhitespace(pr.Title)), cs.Cyan("["+pr.HeadLabel()+"]"))
+		fmt.Fprintf(w, "  %s  %s %s", prStateColorFunc(prNumber), text.Truncate(50, text.RemoveExcessiveWhitespace(pr.Title)), cs.Cyan("["+pr.HeadLabel()+"]"))
 
 		checks := pr.ChecksStatus()
 		reviews := pr.ReviewStatus()
@@ -221,18 +250,7 @@ func printPrs(io *iostreams.IOStreams, totalCount int, prs ...api.PullRequest) {
 			}
 
 			if checks.Total > 0 {
-				var summary string
-				if checks.Failing > 0 {
-					if checks.Failing == checks.Total {
-						summary = cs.Red("× All checks failing")
-					} else {
-						summary = cs.Redf("× %d/%d checks failing", checks.Failing, checks.Total)
-					}
-				} else if checks.Pending > 0 {
-					summary = cs.Yellow("- Checks pending")
-				} else if checks.Passing == checks.Total {
-					summary = cs.Green("✓ Checks passing")
-				}
+				summary := shared.PrCheckStatusSummaryWithColor(cs, checks)
 				fmt.Fprint(w, summary)
 			}
 
@@ -246,7 +264,24 @@ func printPrs(io *iostreams.IOStreams, totalCount int, prs ...api.PullRequest) {
 			} else if reviews.ReviewRequired {
 				fmt.Fprint(w, cs.Yellow("- Review required"))
 			} else if reviews.Approved {
-				fmt.Fprint(w, cs.Green("✓ Approved"))
+				numRequiredApprovals := pr.BaseRef.BranchProtectionRule.RequiredApprovingReviewCount
+				gotApprovals := totalApprovals(&pr)
+				s := fmt.Sprintf("%d", gotApprovals)
+				if numRequiredApprovals > 0 {
+					s = fmt.Sprintf("%d/%d", gotApprovals, numRequiredApprovals)
+				}
+				fmt.Fprint(w, cs.Green(fmt.Sprintf("✓ %s Approved", s)))
+			}
+
+			if pr.Mergeable == api.PullRequestMergeableMergeable {
+				// prefer "No merge conflicts" to "Mergeable" as there is more to mergeability
+				// than the git status. Missing or failing required checks prevent merging
+				// even though a PR is technically mergeable, which is often a source of confusion.
+				fmt.Fprintf(w, " %s", cs.Green("✓ No merge conflicts"))
+			} else if pr.Mergeable == api.PullRequestMergeableConflicting {
+				fmt.Fprintf(w, " %s", cs.Red("× Merge conflicts"))
+			} else if pr.Mergeable == api.PullRequestMergeableUnknown {
+				fmt.Fprintf(w, " %s", cs.Yellow("! Merge conflict status unknown"))
 			}
 
 			if pr.BaseRef.BranchProtectionRule.RequiresStrictStatusChecks {
@@ -258,6 +293,10 @@ func printPrs(io *iostreams.IOStreams, totalCount int, prs ...api.PullRequest) {
 				default:
 					fmt.Fprintf(w, " %s", cs.Green("✓ Up to date"))
 				}
+			}
+
+			if pr.AutoMergeRequest != nil {
+				fmt.Fprintf(w, " %s", cs.Green("✓ Auto-merge enabled"))
 			}
 
 		} else {

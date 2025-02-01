@@ -10,15 +10,15 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/cli/cli/v2/api"
 	remotes "github.com/cli/cli/v2/context"
 	"github.com/cli/cli/v2/git"
-	"github.com/cli/cli/v2/internal/ghinstance"
+	fd "github.com/cli/cli/v2/internal/featuredetection"
 	"github.com/cli/cli/v2/internal/ghrepo"
 	"github.com/cli/cli/v2/pkg/cmdutil"
 	"github.com/cli/cli/v2/pkg/set"
-	graphql "github.com/cli/shurcooL-graphql"
 	"github.com/shurcooL/githubv4"
 	"golang.org/x/sync/errgroup"
 )
@@ -33,16 +33,19 @@ type progressIndicator interface {
 }
 
 type finder struct {
-	baseRepoFn   func() (ghrepo.Interface, error)
-	branchFn     func() (string, error)
-	remotesFn    func() (remotes.Remotes, error)
-	httpClient   func() (*http.Client, error)
-	branchConfig func(string) git.BranchConfig
-	progress     progressIndicator
+	baseRepoFn        func() (ghrepo.Interface, error)
+	branchFn          func() (string, error)
+	remotesFn         func() (remotes.Remotes, error)
+	httpClient        func() (*http.Client, error)
+	pushDefault       func() (string, error)
+	remotePushDefault func() (string, error)
+	parsePushRevision func(string) (string, error)
+	branchConfig      func(string) (git.BranchConfig, error)
+	progress          progressIndicator
 
-	repo       ghrepo.Interface
-	prNumber   int
-	branchName string
+	baseRefRepo ghrepo.Interface
+	prNumber    int
+	branchName  string
 }
 
 func NewFinder(factory *cmdutil.Factory) PRFinder {
@@ -53,12 +56,23 @@ func NewFinder(factory *cmdutil.Factory) PRFinder {
 	}
 
 	return &finder{
-		baseRepoFn:   factory.BaseRepo,
-		branchFn:     factory.Branch,
-		remotesFn:    factory.Remotes,
-		httpClient:   factory.HttpClient,
-		progress:     factory.IOStreams,
-		branchConfig: git.ReadBranchConfig,
+		baseRepoFn: factory.BaseRepo,
+		branchFn:   factory.Branch,
+		remotesFn:  factory.Remotes,
+		httpClient: factory.HttpClient,
+		pushDefault: func() (string, error) {
+			return factory.GitClient.PushDefault(context.Background())
+		},
+		remotePushDefault: func() (string, error) {
+			return factory.GitClient.RemotePushDefault(context.Background())
+		},
+		parsePushRevision: func(branch string) (string, error) {
+			return factory.GitClient.ParsePushRevision(context.Background(), branch)
+		},
+		progress: factory.IOStreams,
+		branchConfig: func(s string) (git.BranchConfig, error) {
+			return factory.GitClient.ReadBranchConfig(context.Background(), s)
+		},
 	}
 }
 
@@ -83,40 +97,118 @@ type FindOptions struct {
 	States []string
 }
 
+// TODO: Does this also need the BaseBranchName?
+// PR's are represented by the following:
+// baseRef -----PR-----> headRef
+//
+// A ref is described as "remoteName/branchName", so
+// baseRepoName/baseBranchName -----PR-----> headRepoName/headBranchName
+type PullRequestRefs struct {
+	BranchName string
+	HeadRepo   ghrepo.Interface
+	BaseRepo   ghrepo.Interface
+}
+
+// GetPRHeadLabel returns the string that the GitHub API uses to identify the PR. This is
+// either just the branch name or, if the PR is originating from a fork, the fork owner
+// and the branch name, like <owner>:<branch>.
+func (s *PullRequestRefs) GetPRHeadLabel() string {
+	if ghrepo.IsSame(s.HeadRepo, s.BaseRepo) {
+		return s.BranchName
+	}
+	return fmt.Sprintf("%s:%s", s.HeadRepo.RepoOwner(), s.BranchName)
+}
+
 func (f *finder) Find(opts FindOptions) (*api.PullRequest, ghrepo.Interface, error) {
+	// If we have a URL, we don't need git stuff
 	if len(opts.Fields) == 0 {
 		return nil, nil, errors.New("Find error: no fields specified")
 	}
 
 	if repo, prNumber, err := f.parseURL(opts.Selector); err == nil {
 		f.prNumber = prNumber
-		f.repo = repo
+		f.baseRefRepo = repo
 	}
 
-	if f.repo == nil {
+	if f.baseRefRepo == nil {
 		repo, err := f.baseRepoFn()
 		if err != nil {
-			return nil, nil, fmt.Errorf("could not determine base repo: %w", err)
+			return nil, nil, err
 		}
-		f.repo = repo
+		f.baseRefRepo = repo
 	}
 
+	var prRefs PullRequestRefs
 	if opts.Selector == "" {
-		if branch, prNumber, err := f.parseCurrentBranch(); err != nil {
+		// You must be in a git repo for this case to work
+		currentBranchName, err := f.branchFn()
+		if err != nil {
 			return nil, nil, err
-		} else if prNumber > 0 {
-			f.prNumber = prNumber
-		} else {
-			f.branchName = branch
 		}
+		f.branchName = currentBranchName
+
+		// Get the branch config for the current branchName
+		branchConfig, err := f.branchConfig(f.branchName)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		// Determine if the branch is configured to merge to a special PR ref
+		prHeadRE := regexp.MustCompile(`^refs/pull/(\d+)/head$`)
+		if m := prHeadRE.FindStringSubmatch(branchConfig.MergeRef); m != nil {
+			prNumber, _ := strconv.Atoi(m[1])
+			f.prNumber = prNumber
+		}
+
+		// Determine the PullRequestRefs from config
+		if f.prNumber == 0 {
+			rems, err := f.remotesFn()
+			if err != nil {
+				return nil, nil, err
+			}
+
+			// Suppressing these errors as we have other means of computing the PullRequestRefs when these fail.
+			parsedPushRevision, _ := f.parsePushRevision(f.branchName)
+
+			pushDefault, err := f.pushDefault()
+			if err != nil {
+				return nil, nil, err
+			}
+
+			remotePushDefault, err := f.remotePushDefault()
+			if err != nil {
+				return nil, nil, err
+			}
+
+			prRefs, err = ParsePRRefs(f.branchName, branchConfig, parsedPushRevision, pushDefault, remotePushDefault, f.baseRefRepo, rems)
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+
 	} else if f.prNumber == 0 {
-		if prNumber, err := strconv.Atoi(strings.TrimPrefix(opts.Selector, "#")); err == nil {
+		// You gave me a selector but I couldn't find a PR number (it wasn't a URL)
+
+		// Try to get a PR number from the selector
+		prNumber, err := strconv.Atoi(strings.TrimPrefix(opts.Selector, "#"))
+		// If opts.Selector is a valid number then assume it is the
+		// PR number unless opts.BaseBranch is specified. This is a
+		// special case for PR create command which will always want
+		// to assume that a numerical selector is a branch name rather
+		// than PR number.
+		if opts.BaseBranch == "" && err == nil {
 			f.prNumber = prNumber
 		} else {
 			f.branchName = opts.Selector
+			// We don't expect an error here because parsedPushRevision is empty
+			prRefs, err = ParsePRRefs(f.branchName, git.BranchConfig{}, "", "", "", f.baseRefRepo, remotes.Remotes{})
+			if err != nil {
+				return nil, nil, err
+			}
 		}
 	}
 
+	// Set up HTTP client
 	httpClient, err := f.httpClient()
 	if err != nil {
 		return nil, nil, err
@@ -131,40 +223,72 @@ func (f *finder) Find(opts FindOptions) (*api.PullRequest, ghrepo.Interface, err
 	fields := set.NewStringSet()
 	fields.AddValues(opts.Fields)
 	numberFieldOnly := fields.Len() == 1 && fields.Contains("number")
-	fields.Add("id") // for additional preload queries below
+	fields.AddValues([]string{"id", "number"}) // for additional preload queries below
+
+	if fields.Contains("isInMergeQueue") || fields.Contains("isMergeQueueEnabled") {
+		cachedClient := api.NewCachedHTTPClient(httpClient, time.Hour*24)
+		detector := fd.NewDetector(cachedClient, f.baseRefRepo.RepoHost())
+		prFeatures, err := detector.PullRequestFeatures()
+		if err != nil {
+			return nil, nil, err
+		}
+		if !prFeatures.MergeQueue {
+			fields.Remove("isInMergeQueue")
+			fields.Remove("isMergeQueueEnabled")
+		}
+	}
+
+	var getProjectItems bool
+	if fields.Contains("projectItems") {
+		getProjectItems = true
+		fields.Remove("projectItems")
+	}
 
 	var pr *api.PullRequest
 	if f.prNumber > 0 {
 		if numberFieldOnly {
 			// avoid hitting the API if we already have all the information
-			return &api.PullRequest{Number: f.prNumber}, f.repo, nil
+			return &api.PullRequest{Number: f.prNumber}, f.baseRefRepo, nil
 		}
-		pr, err = findByNumber(httpClient, f.repo, f.prNumber, fields.ToSlice())
+		pr, err = findByNumber(httpClient, f.baseRefRepo, f.prNumber, fields.ToSlice())
+		if err != nil {
+			return pr, f.baseRefRepo, err
+		}
 	} else {
-		pr, err = findForBranch(httpClient, f.repo, opts.BaseBranch, f.branchName, opts.States, fields.ToSlice())
-	}
-	if err != nil {
-		return pr, f.repo, err
+		pr, err = findForBranch(httpClient, f.baseRefRepo, opts.BaseBranch, prRefs.GetPRHeadLabel(), opts.States, fields.ToSlice())
+		if err != nil {
+			return pr, f.baseRefRepo, err
+		}
 	}
 
 	g, _ := errgroup.WithContext(context.Background())
 	if fields.Contains("reviews") {
 		g.Go(func() error {
-			return preloadPrReviews(httpClient, f.repo, pr)
+			return preloadPrReviews(httpClient, f.baseRefRepo, pr)
 		})
 	}
 	if fields.Contains("comments") {
 		g.Go(func() error {
-			return preloadPrComments(httpClient, f.repo, pr)
+			return preloadPrComments(httpClient, f.baseRefRepo, pr)
 		})
 	}
 	if fields.Contains("statusCheckRollup") {
 		g.Go(func() error {
-			return preloadPrChecks(httpClient, f.repo, pr)
+			return preloadPrChecks(httpClient, f.baseRefRepo, pr)
+		})
+	}
+	if getProjectItems {
+		g.Go(func() error {
+			apiClient := api.NewClientFromHTTP(httpClient)
+			err := api.ProjectsV2ItemsForPullRequest(apiClient, f.baseRefRepo, pr)
+			if err != nil && !api.ProjectsV2IgnorableError(err) {
+				return err
+			}
+			return nil
 		})
 	}
 
-	return pr, f.repo, g.Wait()
+	return pr, f.baseRefRepo, g.Wait()
 }
 
 var pullURLRE = regexp.MustCompile(`^/([^/]+)/([^/]+)/pull/(\d+)`)
@@ -193,47 +317,70 @@ func (f *finder) parseURL(prURL string) (ghrepo.Interface, int, error) {
 	return repo, prNumber, nil
 }
 
-var prHeadRE = regexp.MustCompile(`^refs/pull/(\d+)/head$`)
-
-func (f *finder) parseCurrentBranch() (string, int, error) {
-	prHeadRef, err := f.branchFn()
-	if err != nil {
-		return "", 0, err
+func ParsePRRefs(currentBranchName string, branchConfig git.BranchConfig, parsedPushRevision string, pushDefault string, remotePushDefault string, baseRefRepo ghrepo.Interface, rems remotes.Remotes) (PullRequestRefs, error) {
+	prRefs := PullRequestRefs{
+		BaseRepo: baseRefRepo,
 	}
 
-	branchConfig := f.branchConfig(prHeadRef)
+	// If @{push} resolves, then we have all the information we need to determine the head repo
+	// and branch name. It is of the form <remote>/<branch>.
+	if parsedPushRevision != "" {
+		for _, r := range rems {
+			// Find the remote who's name matches the push <remote> prefix
+			if strings.HasPrefix(parsedPushRevision, r.Name+"/") {
+				prRefs.BranchName = strings.TrimPrefix(parsedPushRevision, r.Name+"/")
+				prRefs.HeadRepo = r.Repo
+				return prRefs, nil
+			}
+		}
 
-	// the branch is configured to merge a special PR head ref
-	if m := prHeadRE.FindStringSubmatch(branchConfig.MergeRef); m != nil {
-		prNumber, _ := strconv.Atoi(m[1])
-		return "", prNumber, nil
+		remoteNames := make([]string, len(rems))
+		for i, r := range rems {
+			remoteNames[i] = r.Name
+		}
+		return PullRequestRefs{}, fmt.Errorf("no remote for %q found in %q", parsedPushRevision, strings.Join(remoteNames, ", "))
 	}
 
-	var branchOwner string
-	if branchConfig.RemoteURL != nil {
-		// the branch merges from a remote specified by URL
-		if r, err := ghrepo.FromURL(branchConfig.RemoteURL); err == nil {
-			branchOwner = r.RepoOwner()
+	// We assume the PR's branch name is the same as whatever f.BranchFn() returned earlier
+	// unless the user has specified push.default = upstream or tracking, then we use the
+	// branch name from the merge ref.
+	prRefs.BranchName = currentBranchName
+	if pushDefault == "upstream" || pushDefault == "tracking" {
+		prRefs.BranchName = strings.TrimPrefix(branchConfig.MergeRef, "refs/heads/")
+	}
+
+	// To get the HeadRepo, we look to the git config. The HeadRepo comes from one of the following, in order of precedence:
+	// 1. branch.<name>.pushRemote
+	// 2. remote.pushDefault
+	// 3. branch.<name>.remote
+	if branchConfig.PushRemoteName != "" {
+		if r, err := rems.FindByName(branchConfig.PushRemoteName); err == nil {
+			prRefs.HeadRepo = r.Repo
+		}
+	} else if branchConfig.PushRemoteURL != nil {
+		if r, err := ghrepo.FromURL(branchConfig.PushRemoteURL); err == nil {
+			prRefs.HeadRepo = r
+		}
+	} else if remotePushDefault != "" {
+		if r, err := rems.FindByName(remotePushDefault); err == nil {
+			prRefs.HeadRepo = r.Repo
 		}
 	} else if branchConfig.RemoteName != "" {
-		// the branch merges from a remote specified by name
-		rem, _ := f.remotesFn()
-		if r, err := rem.FindByName(branchConfig.RemoteName); err == nil {
-			branchOwner = r.RepoOwner()
+		if r, err := rems.FindByName(branchConfig.RemoteName); err == nil {
+			prRefs.HeadRepo = r.Repo
+		}
+	} else if branchConfig.RemoteURL != nil {
+		if r, err := ghrepo.FromURL(branchConfig.RemoteURL); err == nil {
+			prRefs.HeadRepo = r
 		}
 	}
 
-	if branchOwner != "" {
-		if strings.HasPrefix(branchConfig.MergeRef, "refs/heads/") {
-			prHeadRef = strings.TrimPrefix(branchConfig.MergeRef, "refs/heads/")
-		}
-		// prepend `OWNER:` if this branch is pushed to a fork
-		if !strings.EqualFold(branchOwner, f.repo.RepoOwner()) {
-			prHeadRef = fmt.Sprintf("%s:%s", branchOwner, prHeadRef)
-		}
+	// The PR merges from a branch in the same repo as the base branch (usually the default branch)
+	if prRefs.HeadRepo == nil {
+		prRefs.HeadRepo = baseRefRepo
 	}
 
-	return prHeadRef, 0, nil
+	return prRefs, nil
 }
 
 func findByNumber(httpClient *http.Client, repo ghrepo.Interface, number int, fields []string) (*api.PullRequest, error) {
@@ -266,11 +413,14 @@ func findByNumber(httpClient *http.Client, repo ghrepo.Interface, number int, fi
 	return &resp.Repository.PullRequest, nil
 }
 
-func findForBranch(httpClient *http.Client, repo ghrepo.Interface, baseBranch, headBranch string, stateFilters, fields []string) (*api.PullRequest, error) {
+func findForBranch(httpClient *http.Client, repo ghrepo.Interface, baseBranch, headBranchWithOwnerIfFork string, stateFilters, fields []string) (*api.PullRequest, error) {
 	type response struct {
 		Repository struct {
 			PullRequests struct {
 				Nodes []api.PullRequest
+			}
+			DefaultBranchRef struct {
+				Name string
 			}
 		}
 	}
@@ -286,12 +436,13 @@ func findForBranch(httpClient *http.Client, repo ghrepo.Interface, baseBranch, h
 			pullRequests(headRefName: $headRefName, states: $states, first: 30, orderBy: { field: CREATED_AT, direction: DESC }) {
 				nodes {%s}
 			}
+			defaultBranchRef { name }
 		}
 	}`, api.PullRequestGraphQL(fieldSet.ToSlice()))
 
-	branchWithoutOwner := headBranch
-	if idx := strings.Index(headBranch, ":"); idx >= 0 {
-		branchWithoutOwner = headBranch[idx+1:]
+	branchWithoutOwner := headBranchWithOwnerIfFork
+	if idx := strings.Index(headBranchWithOwnerIfFork, ":"); idx >= 0 {
+		branchWithoutOwner = headBranchWithOwnerIfFork[idx+1:]
 	}
 
 	variables := map[string]interface{}{
@@ -314,12 +465,17 @@ func findForBranch(httpClient *http.Client, repo ghrepo.Interface, baseBranch, h
 	})
 
 	for _, pr := range prs {
-		if pr.HeadLabel() == headBranch && (baseBranch == "" || pr.BaseRefName == baseBranch) {
+		headBranchMatches := pr.HeadLabel() == headBranchWithOwnerIfFork
+		baseBranchEmptyOrMatches := baseBranch == "" || pr.BaseRefName == baseBranch
+		// When the head is the default branch, it doesn't really make sense to show merged or closed PRs.
+		// https://github.com/cli/cli/issues/4263
+		isNotClosedOrMergedWhenHeadIsDefault := pr.State == "OPEN" || resp.Repository.DefaultBranchRef.Name != headBranchWithOwnerIfFork
+		if headBranchMatches && baseBranchEmptyOrMatches && isNotClosedOrMergedWhenHeadIsDefault {
 			return &pr, nil
 		}
 	}
 
-	return nil, &NotFoundError{fmt.Errorf("no pull requests found for branch %q", headBranch)}
+	return nil, &NotFoundError{fmt.Errorf("no pull requests found for branch %q", headBranchWithOwnerIfFork)}
 }
 
 func preloadPrReviews(httpClient *http.Client, repo ghrepo.Interface, pr *api.PullRequest) error {
@@ -340,11 +496,11 @@ func preloadPrReviews(httpClient *http.Client, repo ghrepo.Interface, pr *api.Pu
 		"endCursor": githubv4.String(pr.Reviews.PageInfo.EndCursor),
 	}
 
-	gql := graphql.NewClient(ghinstance.GraphQLEndpoint(repo.RepoHost()), httpClient)
+	gql := api.NewClientFromHTTP(httpClient)
 
 	for {
 		var query response
-		err := gql.QueryNamed(context.Background(), "ReviewsForPullRequest", &query, variables)
+		err := gql.Query(repo.RepoHost(), "ReviewsForPullRequest", &query, variables)
 		if err != nil {
 			return err
 		}
@@ -380,11 +536,11 @@ func preloadPrComments(client *http.Client, repo ghrepo.Interface, pr *api.PullR
 		"endCursor": githubv4.String(pr.Comments.PageInfo.EndCursor),
 	}
 
-	gql := graphql.NewClient(ghinstance.GraphQLEndpoint(repo.RepoHost()), client)
+	gql := api.NewClientFromHTTP(client)
 
 	for {
 		var query response
-		err := gql.QueryNamed(context.Background(), "CommentsForPullRequest", &query, variables)
+		err := gql.Query(repo.RepoHost(), "CommentsForPullRequest", &query, variables)
 		if err != nil {
 			return err
 		}
@@ -424,7 +580,7 @@ func preloadPrChecks(client *http.Client, repo ghrepo.Interface, pr *api.PullReq
 				%s
 			}
 		}
-	}`, api.StatusCheckRollupGraphQL("$endCursor"))
+	}`, api.StatusCheckRollupGraphQLWithoutCountByState("$endCursor"))
 
 	variables := map[string]interface{}{
 		"id": pr.ID,
